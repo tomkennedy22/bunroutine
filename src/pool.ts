@@ -2,8 +2,12 @@ import os from "node:os";
 import { serializeTask } from "./task.ts";
 import { PanicError } from "./errors.ts";
 
+type TaskPayload =
+  | { kind: "closure"; source: string }
+  | { kind: "module"; specifier: string; exportName: string };
+
 interface PendingTask {
-  source: string;
+  payload: TaskPayload;
   args: unknown[];
   resolve: (value: any) => void;
   reject: (reason: unknown) => void;
@@ -69,12 +73,33 @@ export class WorkerPool {
     fn: (...args: Args) => R | Promise<R>,
     ...args: Args
   ): Promise<R> {
+    const { source } = serializeTask(fn);
+    return this.#enqueue({ kind: "closure", source }, args);
+  }
+
+  /**
+   * Runs the export named `exportName` from the module at `specifier`,
+   * passing `args`. Unlike `run()`, this never touches `fn.toString()` —
+   * the worker just `import()`s the module itself — so there's no
+   * closure/free-variable landmine, at the cost of the task having to live
+   * in its own module instead of an inline closure. `specifier` must resolve
+   * on its own from inside the worker, so pass an absolute URL, e.g.
+   * `new URL("./tasks.ts", import.meta.url)`.
+   */
+  runModule<Args extends unknown[], R>(
+    specifier: string | URL,
+    exportName: string,
+    ...args: Args
+  ): Promise<R> {
+    return this.#enqueue({ kind: "module", specifier: specifier.toString(), exportName }, args);
+  }
+
+  #enqueue<R>(payload: TaskPayload, args: unknown[]): Promise<R> {
     if (this.#destroyed) {
       return Promise.reject(new Error("bunroutine: pool is destroyed"));
     }
-    const { source } = serializeTask(fn);
     return new Promise<R>((resolve, reject) => {
-      const task: PendingTask = { source, args, resolve, reject };
+      const task: PendingTask = { payload, args, resolve, reject };
       const idle = this.#slots.find((slot) => !slot.busy);
       if (idle) {
         this.#dispatch(idle, task);
@@ -132,7 +157,7 @@ export class WorkerPool {
     slot.busy = true;
     slot.current = { resolve: task.resolve, reject: task.reject };
     const id = nextTaskId++;
-    slot.worker.postMessage({ id, source: task.source, args: task.args });
+    slot.worker.postMessage({ id, args: task.args, ...task.payload });
   }
 }
 

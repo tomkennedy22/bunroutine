@@ -63,34 +63,47 @@ channels.
 
 ```
 src/
-  index.ts     public API: go(), setPoolSize(), shutdown()
-  pool.ts      WorkerPool — spawns and schedules Bun Worker threads
-  worker.ts    code that runs inside each worker thread
-  task.ts      function -> source-string serialization for go()
-  channel.ts   Channel<T> — buffered/unbuffered, same-thread only
-  select.ts    select() — race multiple channel receives
-  sync.ts      WaitGroup, Mutex — same-thread only
-  errors.ts    PanicError, ChannelClosedError
-examples/      runnable demos (bun run examples/<name>.ts)
-test/          bun:test suite
+  index.ts        public API: go(), goModule(), setPoolSize(), shutdown()
+  pool.ts         WorkerPool — spawns and schedules Bun Worker threads
+  worker.ts       code that runs inside each worker thread
+  task.ts         function -> source-string serialization for go()
+  channel.ts      Channel<T> — buffered/unbuffered, same-thread only
+  select.ts       select() — race multiple channel receives
+  sync.ts         WaitGroup, Mutex — same-thread only
+  shared-mutex.ts SharedMutex — real cross-thread lock via SharedArrayBuffer
+  errors.ts       PanicError, ChannelClosedError
+examples/         runnable demos (bun run examples/<name>.ts)
+test/             bun:test suite
 ```
 
 ## API
 
 - **`go(fn, ...args)`** — runs `fn(...args)` on the shared default worker
   pool, returns a `Promise` of the result. Closest analogue to `go func(){}()`.
+  `fn` is reconstructed from source in the worker, so it can't close over
+  outer scope — see below.
+- **`goModule(specifier, exportName, ...args)`** — same idea, but instead of
+  serializing a closure, the worker `import()`s the module at `specifier`
+  and calls its `exportName` export. No free-variable landmine, at the cost
+  of the task needing to be a real exported function rather than an inline
+  closure. `specifier` must resolve on its own inside the worker — pass an
+  absolute URL, e.g. `new URL("./tasks.ts", import.meta.url)`.
 - **`new WorkerPool({ size })`** — an explicit pool (default size is the
-  machine's available parallelism) with `.run(fn, ...args)`, `.size`,
-  `.queued`, `.destroy()`.
+  machine's available parallelism) with `.run(fn, ...args)`,
+  `.runModule(specifier, exportName, ...args)`, `.size`, `.queued`, `.destroy()`.
 - **`new Channel<T>(capacity = 0)`** — `send`, `receive`, `tryReceive`,
   `close`, async-iterable. Capacity 0 is a Go-style unbuffered/rendezvous
-  channel.
+  channel. Same-thread only.
 - **`select(channels)`** — resolves `{ done: false, index, value }` for
   whichever channel produces a value first, or `{ done: true, index: -1 }`
   if one is closed and drained.
-- **`new WaitGroup()`** — `add(n)`, `done()`, `wait()`.
+- **`new WaitGroup()`** — `add(n)`, `done()`, `wait()`. Same-thread only.
 - **`new Mutex()`** — `lock()` returns a release function; `withLock(fn)`
-  runs `fn` while held.
+  runs `fn` while held. Same-thread only.
+- **`new SharedMutex(buffer?)`** — real mutual exclusion *across worker
+  threads*, backed by a `SharedArrayBuffer` and `Atomics`. Share `.buffer`
+  with a worker (it's passed by reference, not copied) and reconstruct with
+  `new SharedMutex(buffer)` on the other side to lock the same memory.
 
 ## Key problems (and where they currently stand)
 
@@ -114,20 +127,47 @@ Arrow functions have no equivalent fix — they were never self-referencing
 in the first place, so recursive arrows genuinely cannot cross the thread
 boundary; use a named `function`.
 
-The honest long-term fix is a second, non-inline way to define worker
-tasks: point `go()` at an exported function in its own module (`import()`
-it inside the worker) instead of relying on `toString`/`eval`. That's more
-verbose — no more inline closures — but has none of the free-variable or
-minifier failure modes. Worth adding as an opt-in `goModule(url, exportName, ...args)`
-once the toString-based path's limits become a real pain point.
+**Resolved:** `goModule()` / `WorkerPool.runModule()` is the honest long-term
+fix — point the worker at an exported function in its own module instead of
+relying on `toString`/`eval`. More verbose (no inline closures), but none of
+the free-variable or minifier failure modes. Use `go()` for quick inline
+tasks, `goModule()` once a task needs to reference real outer state.
 
-**No shared memory across `go()` calls.** Every argument and return value is
-structured-cloned. Fine for typical task payloads; a serialization tax for
-large buffers. `SharedArrayBuffer` + `Atomics` would let two threads see the
-same bytes, which is the real prerequisite for a cross-thread `Channel` or
-`Mutex` — not yet implemented. Whether Bun's JSC supports `Atomics.waitAsync`
-(needed for a non-blocking cross-thread wait) needs to be checked before
-building that.
+**No shared memory across `go()` calls — partially resolved.** Every
+argument and return value passed through `go()`/`goModule()` is still
+structured-cloned; fine for typical payloads, a serialization tax for large
+ones. But `SharedArrayBuffer` + `Atomics` *is* now used where it matters
+most: `Atomics.waitAsync` is confirmed working on Bun (tested directly —
+one worker `Atomics.wait`s on a `SharedArrayBuffer` cell, another
+`Atomics.notify`s it from a different OS thread, and the first one wakes,
+non-blockingly), so `SharedMutex` gives real cross-thread mutual exclusion
+today. Verified with an actual regression test (`test/shared-mutex.test.ts`):
+two real worker threads race 500 increments each against a shared counter;
+with the lock the count lands exactly on 1000, and a manual no-lock control
+run of the same setup landed on 500 — i.e. the test would actually catch a
+broken lock, not just pass by construction.
+
+A cross-thread `Channel` (queue instead of a single lock cell) is the
+natural next step on the same primitive, but isn't built yet — it needs a
+ring buffer of shared slots plus the send/receive rendezvous logic
+`Channel` already has, redone in terms of indices into a `SharedArrayBuffer`
+rather than a plain JS array.
+
+**The `postMessage` envelope has a real, measured cost.** Bun 1.2.21+ has a
+fast path that shares a string's pointer across threads instead of copying
+it — but only when the string is the *sole* value in the message (per
+[Bun's writeup](https://bun.com/blog/how-we-made-postMessage-string-500x-faster)).
+Benchmarked directly against this library's shape: round-tripping a 3MB
+string alone took ~0.06ms; the exact same string wrapped in our task
+envelope (`{ id, kind, source, args }`) took ~1.5ms — about 25x slower —
+and it doesn't matter whether the wrapper is an object or an array, only
+whether the string has sibling fields at all. So today, every `go()`/
+`goModule()` call pays the slow structured-clone path for its arguments and
+return value, string or not, because `id`/`kind`/`args` always ride along.
+This is invisible for typical small payloads but a real, avoidable cost for
+large string arguments or results (e.g. passing a big blob of text into a
+worker). Fixing it would mean a second, bare-string send path alongside the
+normal envelope — not built yet.
 
 **`select()` can't be perfectly fair.** Go's `select` atomically commits to
 one ready case, chosen at random among ties, without disturbing the others.
@@ -162,18 +202,41 @@ that terminates the specific worker is on the roadmap but not implemented.
 
 ## Roadmap
 
-- [ ] `goModule()` — module-reference-based task dispatch as a robust
+- [x] `goModule()` — module-reference-based task dispatch as a robust
       alternative to `toString`/`eval` for anything that needs closures.
-- [ ] Cross-thread `Channel`/`Mutex` backed by `SharedArrayBuffer` + `Atomics`
-      (pending an `Atomics.waitAsync` feasibility check on Bun/JSC).
+- [x] `Atomics.waitAsync` feasibility check on Bun/JSC — confirmed working,
+      including a real cross-thread wake (one worker waits, a different OS
+      thread notifies).
+- [x] Cross-thread `Mutex` backed by `SharedArrayBuffer` + `Atomics` — done
+      as `SharedMutex`, with a test that spawns two real worker threads and
+      would fail if the lock didn't actually exclude.
+- [ ] Cross-thread `Channel` — same `SharedArrayBuffer`/`Atomics` foundation
+      as `SharedMutex`, extended to a ring buffer for a queue of values
+      instead of a single lock bit.
+- [ ] A bare-string fast send path for large string args/results, to
+      actually get Bun's `postMessage` string fast path instead of losing
+      it to the `{id, kind, args}` envelope every task currently rides in.
+      Only matters once a task's argument or return value is a large
+      string; measured cost is documented above.
 - [ ] Cancellation via `AbortSignal`, tearing down the specific worker.
-- [ ] Least-busy or work-stealing dispatch instead of "first idle slot,
-      else FIFO queue" — matters once tasks have very uneven cost.
 - [ ] Benchmarks comparing `go()` throughput/latency against a plain
       `Promise.all` baseline and against Node's `worker_threads` pool
       libraries (Piscina, workerpool), across a range of task sizes.
-- [ ] `.d.ts` build output / publish to npm — currently intended for direct
-      TS import (`"module"`/`"types"` both point at `src/index.ts`).
+
+Deliberately not planned, and why:
+
+- **Least-busy/work-stealing dispatch.** Moot under the current model —
+  each worker runs exactly one task at a time, so "busy" is already binary
+  and "first idle slot, else FIFO queue" *is* least-busy dispatch. This
+  would only become a real question if a worker were ever allowed to run
+  multiple tasks concurrently, which it isn't.
+- **`.d.ts` build output.** Unnecessary: this package only runs on Bun (it
+  uses Bun's `Worker`/`import.meta.url` resolution throughout, see
+  `engines.bun` in `package.json`), so every consumer already has a
+  TypeScript-aware runtime pointed straight at `src/index.ts` — the real
+  source *is* the type declaration. A `.d.ts`/JS build would only matter
+  for consumers on a different runtime, which this package doesn't support
+  anyway.
 
 ## Development
 
@@ -184,4 +247,5 @@ bun run typecheck      # tsc --noEmit
 bun run examples/fibonacci.ts
 bun run examples/pipeline.ts
 bun run examples/fanin.ts
+bun run examples/module-task.ts
 ```

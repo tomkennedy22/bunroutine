@@ -6,6 +6,7 @@ export { Channel } from "./channel.ts";
 export { select } from "./select.ts";
 export type { SelectResult } from "./select.ts";
 export { WaitGroup, Mutex } from "./sync.ts";
+export { SharedMutex } from "./shared-mutex.ts";
 export { PanicError, ChannelClosedError } from "./errors.ts";
 
 let defaultPool: WorkerPool | undefined;
@@ -25,6 +26,21 @@ export function go<Args extends unknown[], R>(
   ...args: Args
 ): Promise<R> {
   return defaultPoolInstance().run(fn, ...args);
+}
+
+/**
+ * Runs the export named `exportName` from the module at `specifier` on the
+ * shared default pool, passing `args`. A closure-free alternative to `go()`
+ * for tasks that need to reference outer state — define the task as a
+ * top-level export in its own module instead of an inline function. See
+ * `WorkerPool.runModule` for the full explanation of the tradeoff.
+ */
+export function goModule<Args extends unknown[], R>(
+  specifier: string | URL,
+  exportName: string,
+  ...args: Args
+): Promise<R> {
+  return defaultPoolInstance().runModule(specifier, exportName, ...args);
 }
 
 /**

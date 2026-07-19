@@ -1,6 +1,6 @@
 {
   "name": "bunroutine",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Go-goroutine-flavored concurrency for Bun: a real worker-thread pool plus Go-style channels, select, WaitGroup and Mutex for same-thread coordination.",
   "module": "src/index.ts",
   "main": "src/index.ts",
@@ -35,7 +35,8 @@
     "typecheck": "tsc --noEmit",
     "example:fib": "bun run examples/fibonacci.ts",
     "example:pipeline": "bun run examples/pipeline.ts",
-    "example:fanin": "bun run examples/fanin.ts"
+    "example:fanin": "bun run examples/fanin.ts",
+    "example:module-task": "bun run examples/module-task.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
