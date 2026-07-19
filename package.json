@@ -1,8 +1,42 @@
 {
-  "name": "bunroutines",
-  "module": "index.ts",
+  "name": "bunroutine",
+  "version": "0.1.0",
+  "description": "Go-goroutine-flavored concurrency for Bun: a real worker-thread pool plus Go-style channels, select, WaitGroup and Mutex for same-thread coordination.",
+  "module": "src/index.ts",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "author": "Thomas Kennedy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tomkennedy22/bunroutine.git"
+  },
+  "homepage": "https://github.com/tomkennedy22/bunroutine#readme",
+  "bugs": "https://github.com/tomkennedy22/bunroutine/issues",
+  "keywords": [
+    "bun",
+    "concurrency",
+    "goroutines",
+    "channels",
+    "worker-threads",
+    "parallelism"
+  ],
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "example:fib": "bun run examples/fibonacci.ts",
+    "example:pipeline": "bun run examples/pipeline.ts",
+    "example:fanin": "bun run examples/fanin.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
