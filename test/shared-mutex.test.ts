@@ -24,8 +24,8 @@ test("real cross-thread mutual exclusion across two worker threads", async () =>
   const counterBuffer = new SharedArrayBuffer(4);
   const iterations = 500;
 
-  const worker1 = new Worker(new URL("./fixtures/shared-mutex-worker.ts", import.meta.url).href);
-  const worker2 = new Worker(new URL("./fixtures/shared-mutex-worker.ts", import.meta.url).href);
+  const worker1 = new Worker(import.meta.resolve("./fixtures/shared-mutex-worker.ts"));
+  const worker2 = new Worker(import.meta.resolve("./fixtures/shared-mutex-worker.ts"));
 
   const done1 = new Promise<void>((resolve) => {
     worker1.onmessage = () => resolve();

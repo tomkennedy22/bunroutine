@@ -36,7 +36,8 @@
     "example:fib": "bun run examples/fibonacci.ts",
     "example:pipeline": "bun run examples/pipeline.ts",
     "example:fanin": "bun run examples/fanin.ts",
-    "example:module-task": "bun run examples/module-task.ts"
+    "example:module-task": "bun run examples/module-task.ts",
+    "example:chunked-map": "bun run examples/chunked-map.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

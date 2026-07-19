@@ -28,6 +28,16 @@ interface WorkerResultMessage {
 
 let nextTaskId = 0;
 
+/** The exported names of `M` whose value is callable — i.e. usable as a `goModule`/`runModule` task. */
+export type ModuleTaskNames<M> = {
+  [K in keyof M]: M[K] extends (...args: any[]) => any ? K : never;
+}[keyof M];
+
+/** The real function type behind export `K` of module `M`, for deriving `Parameters`/`ReturnType`. */
+export type ModuleTaskFn<M, K extends keyof M> = M[K] extends (...args: any[]) => any
+  ? M[K]
+  : never;
+
 export interface WorkerPoolOptions {
   /** Number of OS threads to keep warm. Defaults to the machine's available parallelism. */
   size?: number;
@@ -83,15 +93,60 @@ export class WorkerPool {
    * the worker just `import()`s the module itself — so there's no
    * closure/free-variable landmine, at the cost of the task having to live
    * in its own module instead of an inline closure. `specifier` must resolve
-   * on its own from inside the worker, so pass an absolute URL, e.g.
-   * `new URL("./tasks.ts", import.meta.url)`.
+   * on its own from inside the worker, so pass an absolute URL — the
+   * standard way is `import.meta.resolve("./tasks.ts")`.
+   *
+   * `M` is supplied explicitly as `typeof import("./tasks.ts")` — a
+   * type-only import, erased at runtime — so `exportName` is checked
+   * against the module's real exports (typo it and it won't compile) and
+   * `args`/the return type are derived from that export's actual signature,
+   * not hand-asserted. The one thing TypeScript can't verify is that the
+   * type-level path in `typeof import(...)` and the runtime `specifier`
+   * string point at the same file — keep those two in sync yourself.
    */
-  runModule<Args extends unknown[], R>(
+  runModule<M, K extends ModuleTaskNames<M> & string>(
     specifier: string | URL,
-    exportName: string,
-    ...args: Args
-  ): Promise<R> {
+    exportName: K,
+    ...args: Parameters<ModuleTaskFn<M, K>>
+  ): Promise<Awaited<ReturnType<ModuleTaskFn<M, K>>>> {
     return this.#enqueue({ kind: "module", specifier: specifier.toString(), exportName }, args);
+  }
+
+  /**
+   * Like `runModule()`, but instead of naming the export with a string and
+   * a manually-supplied `M`/`K`, pass the already-imported function itself
+   * — a real (non-type-only) import, so it costs loading the module on the
+   * calling side too, not just inside the worker:
+   *
+   * ```ts
+   * import { double } from "./tasks.ts";
+   * const result = await pool.runModuleFn(double, import.meta.resolve("./tasks.ts"), 21);
+   * ```
+   *
+   * `Fn` is inferred from `fn` — no type arguments to write — and the
+   * export name dispatched to the worker is `fn.name`, which reflects the
+   * function's *original* declared name even through a renamed import
+   * (`import { double as d }` — `d.name` is still `"double"`). A function
+   * without a usable name (anonymous, or wrapped with `.bind()`, which
+   * mangles the name to `"bound double"`) fails clearly instead of silently
+   * calling the wrong thing. `specifier` still has to be supplied
+   * separately and kept in sync with wherever `fn` actually came from —
+   * nothing here can check that the two agree.
+   */
+  runModuleFn<Fn extends (...args: any[]) => any>(
+    fn: Fn,
+    specifier: string | URL,
+    ...args: Parameters<Fn>
+  ): Promise<Awaited<ReturnType<Fn>>> {
+    if (!fn.name) {
+      throw new TypeError(
+        "bunroutine: runModuleFn() requires a named function so its .name can be dispatched to the worker",
+      );
+    }
+    return this.#enqueue(
+      { kind: "module", specifier: specifier.toString(), exportName: fn.name },
+      args,
+    );
   }
 
   #enqueue<R>(payload: TaskPayload, args: unknown[]): Promise<R> {
@@ -120,7 +175,7 @@ export class WorkerPool {
   }
 
   #spawnSlot(): WorkerSlot {
-    const worker = new Worker(new URL("./worker.ts", import.meta.url).href);
+    const worker = new Worker(import.meta.resolve("./worker.ts"));
     const slot: WorkerSlot = { worker, busy: false };
 
     worker.onmessage = (event: MessageEvent<WorkerResultMessage>) => {

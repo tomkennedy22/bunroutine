@@ -63,7 +63,7 @@ channels.
 
 ```
 src/
-  index.ts        public API: go(), goModule(), setPoolSize(), shutdown()
+  index.ts        public API: go(), goModule(), moduleTasks(), goModuleFn(), setPoolSize(), shutdown()
   pool.ts         WorkerPool — spawns and schedules Bun Worker threads
   worker.ts       code that runs inside each worker thread
   task.ts         function -> source-string serialization for go()
@@ -82,15 +82,84 @@ test/             bun:test suite
   pool, returns a `Promise` of the result. Closest analogue to `go func(){}()`.
   `fn` is reconstructed from source in the worker, so it can't close over
   outer scope — see below.
-- **`goModule(specifier, exportName, ...args)`** — same idea, but instead of
-  serializing a closure, the worker `import()`s the module at `specifier`
-  and calls its `exportName` export. No free-variable landmine, at the cost
-  of the task needing to be a real exported function rather than an inline
-  closure. `specifier` must resolve on its own inside the worker — pass an
-  absolute URL, e.g. `new URL("./tasks.ts", import.meta.url)`.
+- **`goModule<M, K>(specifier, exportName, ...args)`** — same idea, but
+  instead of serializing a closure, the worker `import()`s the module at
+  `specifier` and calls its `exportName` export. No free-variable landmine,
+  at the cost of the task needing to be a real exported function rather
+  than an inline closure. `specifier` must resolve on its own inside the
+  worker — pass an absolute URL, e.g. `import.meta.resolve("./tasks.ts")`
+  (the standard way to turn a relative path into an absolute one from the
+  current module).
+
+  `M` and `K` are how this stays fully typed: pass `M` explicitly as
+  `typeof import("./tasks.ts")` — a type-only import, erased at runtime —
+  and `K` (`exportName`) is checked against `M`'s *real* exports, with
+  `args`/the return type derived from that export's actual signature:
+
+  ```ts
+  const result = await goModule<typeof import("./tasks.ts"), "double">(
+    import.meta.resolve("./tasks.ts"),
+    "double",
+    21,
+  );
+  ```
+
+  Typo `"double"`, pass the wrong argument type, or assume the wrong return
+  type, and this fails to compile rather than misbehaving at runtime — the
+  one thing it *can't* check is whether the type-level path in
+  `typeof import(...)` and the runtime `specifier` string agree on which
+  file they mean; keep those two in sync yourself.
+- **`moduleTasks<M>(specifier)`** — binds `M` and `specifier` once and
+  returns `{ run(exportName, ...args) }`, so calling multiple exports from
+  the same module doesn't repeat either — only the export name, inferred
+  from each `.run()` call rather than written out as a type argument every
+  time:
+
+  ```ts
+  const tasks = moduleTasks<typeof import("./tasks.ts")>(
+    import.meta.resolve("./tasks.ts"),
+  );
+  await tasks.run("double", 21);
+  await tasks.run("delayedSum", 2, 3);
+  ```
+
+  `specifier` still appears twice across the snippet above (type argument,
+  then runtime value) — that part can't be collapsed further. TypeScript
+  requires a literal string directly in a `typeof import(...)` position,
+  even behind a generic type parameter (verified directly: `function f<P
+  extends string>(p: P): typeof import(P)` is a hard compile error, `String
+  literal expected`), so there's no way to derive the type-only import from
+  a runtime value. `moduleTasks()` only removes the export-name repetition.
+- **`goModuleFn(fn, specifier, ...args)`** — pass the already-imported
+  function itself instead of a string `exportName` and manual `M`/`K` type
+  arguments:
+
+  ```ts
+  import { double } from "./tasks.ts";
+  const result = await goModuleFn(double, import.meta.resolve("./tasks.ts"), 21);
+  ```
+
+  No type arguments at all — `Fn` is inferred straight from `fn` — and no
+  string to typo, since the export name dispatched to the worker is
+  `fn.name`, which reflects the function's *original* declared name even
+  through a renamed import (`import { double as d }` — `d.name` is still
+  `"double"`, verified directly). A function with no usable name — genuinely
+  anonymous, or wrapped with `.bind()` (which mangles the name to `"bound
+  double"`) — fails clearly (synchronously for anonymous, as a rejected
+  promise from the worker for a bound/mangled name) instead of silently
+  dispatching the wrong thing.
+
+  The tradeoff: `fn` has to be a real import, so the task module loads on
+  the calling thread too, not just inside the worker — negligible for a
+  small task module, worth knowing if the module is heavy or has expensive
+  top-level side effects, in which case prefer `goModule`/`moduleTasks`
+  above (type-only import, never loaded on the calling side). Same residual
+  gap as everything else here: nothing checks that `specifier` really
+  points at the module `fn` came from.
 - **`new WorkerPool({ size })`** — an explicit pool (default size is the
   machine's available parallelism) with `.run(fn, ...args)`,
-  `.runModule(specifier, exportName, ...args)`, `.size`, `.queued`, `.destroy()`.
+  `.runModule(specifier, exportName, ...args)`, `.runModuleFn(fn, specifier, ...args)`,
+  `.size`, `.queued`, `.destroy()`.
 - **`new Channel<T>(capacity = 0)`** — `send`, `receive`, `tryReceive`,
   `close`, async-iterable. Capacity 0 is a Go-style unbuffered/rendezvous
   channel. Same-thread only.
@@ -133,6 +202,22 @@ relying on `toString`/`eval`. More verbose (no inline closures), but none of
 the free-variable or minifier failure modes. Use `go()` for quick inline
 tasks, `goModule()` once a task needs to reference real outer state.
 
+It also closes a real type-safety gap `go()` still has. `go(fn, ...args)`
+type-checks `Args`/`R` against `fn`'s *declared* signature — as if you were
+calling it locally — but what actually executes is `fn` reconstructed from
+source in a different realm, so if `fn` depends on a free variable that
+doesn't survive that trip, TypeScript has no way to know; it confidently
+reports the return type as `R` right up until the `ReferenceError` at
+runtime. `goModule<M, K>` doesn't have this gap: passing `M` as
+`typeof import("./tasks.ts")` (type-only, erased at runtime) means
+`exportName`, `args`, and the return type are all checked against that
+module's *real* exports — verified directly: typo the export name, pass a
+wrong argument type, or assume the wrong return type, and it fails to
+compile (see the worked examples above). The one thing left unchecked is
+whether the type-level import path and the runtime `specifier` string
+happen to agree on which file they mean — TypeScript has no way to compare
+a type-position string against a runtime string value.
+
 **No shared memory across `go()` calls — partially resolved.** Every
 argument and return value passed through `go()`/`goModule()` is still
 structured-cloned; fine for typical payloads, a serialization tax for large
@@ -168,6 +253,25 @@ This is invisible for typical small payloads but a real, avoidable cost for
 large string arguments or results (e.g. passing a big blob of text into a
 worker). Fixing it would mean a second, bare-string send path alongside the
 normal envelope — not built yet.
+
+**Big arrays of nested objects pay a real structured-clone tax — chunk
+them.** Benchmarked directly: `postMessage`-ing 100,000 small nested objects
+(`{ id, name, position: { x, y, z }, tags: [...] }`) took ~121ms of pure
+clone overhead, versus ~2.4ms for the same numeric data reshaped into
+`Float64Array`s over a `SharedArrayBuffer` and shared zero-copy. `go()`/
+`goModule()` don't do that reshaping for you — a plain array of objects
+always gets fully cloned in and back out. Two consequences: if the
+per-item work is cheap (a filter/map over a few fields), the clone cost
+dominates and parallelizing will likely make things *slower*, not faster —
+just do it on the main thread. If the per-item work is genuinely expensive
+(parsing, regex, crypto, image processing), don't call `go()`/`goModule()`
+once per item either — chunk the array into `hardwareConcurrency`-many
+batches and dispatch one task per batch, so the clone tax is paid once per
+batch instead of once per item and gets amortized against real CPU work.
+`examples/chunked-map.ts` demonstrates this end to end (and, as a bonus,
+why it uses `goModuleFn()` rather than `go()`: the chunk-processing function
+calls a sibling helper function, which `go()`'s `toString()`-based
+reconstruction can't see).
 
 **`select()` can't be perfectly fair.** Go's `select` atomically commits to
 one ready case, chosen at random among ties, without disturbing the others.
@@ -248,4 +352,5 @@ bun run examples/fibonacci.ts
 bun run examples/pipeline.ts
 bun run examples/fanin.ts
 bun run examples/module-task.ts
+bun run examples/chunked-map.ts
 ```
