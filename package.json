@@ -1,6 +1,6 @@
 {
   "name": "bunroutine",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Go-goroutine-flavored concurrency for Bun: a real worker-thread pool plus Go-style channels, select, WaitGroup and Mutex for same-thread coordination.",
   "module": "src/index.ts",
   "main": "src/index.ts",
